@@ -1,0 +1,11 @@
+__pycache__
+*.json
+*.pyc
+*.pickle
+test*
+venv/
+venv2/
+*.egg-info/
+*.egg
+dist/
+build/
