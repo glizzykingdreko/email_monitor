@@ -2,9 +2,9 @@
 # Search for emails with a specific subject and text using regex
 
 import re
-from mail_reader import IMAPMailMonitor
+from email_monitor import EmailMonitor
 
-monitor = IMAPMailMonitor(credentials_file="credentials.json")
+monitor = EmailMonitor(credentials_file="credentials.json")
 
 email = monitor.search_mail(
     query={

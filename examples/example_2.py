@@ -1,9 +1,9 @@
 
 # Search for emails from a specific sender and wait for a match
 
-from mail_reader import IMAPMailMonitor
+from email_monitor import EmailMonitor
 
-monitor = IMAPMailMonitor(credentials_file="credentials.json")
+monitor = EmailMonitor(credentials_file="credentials.json")
 
 email = monitor.search_mail(
     query={"from": "jane.doe@example.com"},
