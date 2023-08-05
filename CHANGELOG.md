@@ -11,6 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Expand IMAP support for non-Gmail OAuth providers.
 - Improve email handling for various email services.
 
+## [0.1.1] - 2023-08-05
+
+### Changed
+- In case of error while decoding email body, the body is now returned as a string instead of raising an exception.
+
 ## [0.1.0] - 2023-04-21
 
 ### Added

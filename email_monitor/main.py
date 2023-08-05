@@ -339,7 +339,9 @@ class EmailMonitor:
                             if msg_data.get('raw'):
                                 msg = email.message_from_string(msg_data['raw'])
                             else:
-                                msg = b64decode(msg_data['payload']['parts'][0]['body']['data'].encode('utf-8')).decode('utf-8')
+                                body = msg_data['payload']['parts'][0]['body']['data']
+                                try: msg = b64decode(body.encode('utf-8')).decode('utf-8')
+                                except: return body
                             if value := query.get('text'):
                                 if isinstance(value, str):
                                     if value in msg:
