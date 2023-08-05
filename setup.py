@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="email_monitor",
-    version="0.1.0",
+    version="0.1.1",
     author="glizzykingdreko",
     author_email="glizzykingdreko@protonmail.com",
     description="A versatile IMAP mail monitoring module with Gmail API support, regex queries, and flexible search options",
