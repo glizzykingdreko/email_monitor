@@ -3,14 +3,27 @@ from logging import getLogger, Logger, DEBUG, StreamHandler, Formatter
 from typing import Union, Dict
 from time import sleep
 from base64 import b64decode
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
 
 from .exceptions import InvalidCredentialsError, CredentialFileRequiredError, \
     EmailMonitorConnectionError, CredentialFileInvalidError
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+# Lazy imports for Google API (only when needed)
+InstalledAppFlow = None
+Request = None
+build = None
+
+def _load_google_api():
+    """Lazy load Google API libraries."""
+    global InstalledAppFlow, Request, build
+    if InstalledAppFlow is None:
+        from google_auth_oauthlib.flow import InstalledAppFlow as _InstalledAppFlow
+        from google.auth.transport.requests import Request as _Request
+        from googleapiclient.discovery import build as _build
+        InstalledAppFlow = _InstalledAppFlow
+        Request = _Request
+        build = _build
 
 class EmailMonitor:
     def __init__(
@@ -98,6 +111,7 @@ class EmailMonitor:
         self.gmail_auth = bool(credentials_file)
         self.logger.info(f"Initializing {self.__class__.__name__}...")
         if self.gmail_auth:
+            _load_google_api()  # Load Google API libraries
             self.logger.info(f"Using Google API with credentials file {credentials_file}")
             self.user = user
             self.credentials_file = credentials_file
@@ -188,11 +202,63 @@ class EmailMonitor:
             self.logger.info("Disconnecting from the mailbox...")
             self.mailbox.logout()
     
+    def _get_email_body(self, email_message) -> str:
+        """
+        Extract the body text from an email message, handling multipart emails
+        and various encodings.
+        
+        Args:
+            email_message: An email.message.Message object
+            
+        Returns:
+            str: The decoded email body text
+        """
+        body = ""
+        
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition", ""))
+                
+                # Skip attachments
+                if "attachment" in content_disposition:
+                    continue
+                    
+                # Get text content (prefer plain text)
+                if content_type == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        try:
+                            body = payload.decode(charset, errors='replace')
+                        except (LookupError, UnicodeDecodeError):
+                            body = payload.decode('utf-8', errors='replace')
+                        break
+                elif content_type == "text/html" and not body:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or 'utf-8'
+                        try:
+                            body = payload.decode(charset, errors='replace')
+                        except (LookupError, UnicodeDecodeError):
+                            body = payload.decode('utf-8', errors='replace')
+        else:
+            payload = email_message.get_payload(decode=True)
+            if payload:
+                charset = email_message.get_content_charset() or 'utf-8'
+                try:
+                    body = payload.decode(charset, errors='replace')
+                except (LookupError, UnicodeDecodeError):
+                    body = payload.decode('utf-8', errors='replace')
+        
+        return body
+    
     def search_mail(
         self, 
         query: Dict[str, Union[str, re.Pattern]],
         wait_for_match: bool = False,
         unread: bool = True,
+        mark_as_read: bool = True,
         labels: list = [],
         delay: int = 5
     ) -> Union[str, None]:
@@ -206,9 +272,11 @@ class EmailMonitor:
             `wait_for_match`: bool
                 If set to True, the function will wait for a new email to match the query and return it.
             `unread`: bool
-                If set to True, the function will search for emails that have already been read.
+                If set to True, the function will only search for unread emails.
+            `mark_as_read`: bool
+                If set to True (default), the matched email will be marked as read.
             `labels`: list
-                A list of labels to search for. Only works with Gmail.
+                A list of labels to search for. Only works with Gmail API.
             `delay`: int
                 The delay in seconds between each search if `wait_for_match` is set to True.
         
@@ -224,10 +292,9 @@ class EmailMonitor:
                     service = build('gmail', 'v1', credentials=self.credentials)
                     search_criteria = []
 
-                    if not unread:
+                    if unread:
                         search_criteria.append('is:unread')
-                    else:
-                        search_criteria.append('is:read')
+                    # Note: Gmail API doesn't have a direct 'is:read' filter, we just don't filter by read status
                     for key, value in query.items():
                         if key.lower() in ["subject", "from", "to"]:
                             search_criteria.append(f'{key.lower()}:"{value}"')
@@ -354,27 +421,60 @@ class EmailMonitor:
                         else:
                             self.logger.debug(f"Message {msg_id} does not contain the labels {labels}")
                 else:
-                    # IMAP generic
-                    if not service:
-                        raise Exception("No IMAP service provided")
-
-                    if unread:
-                        service.select("INBOX")
-                        _, data = service.search(None, 'UNSEEN')
-                    else:
-                        service.select("INBOX")
-                        _, data = service.search(None, 'ALL')
+                    # IMAP generic - fetch recent emails by message number (newest first)
+                    _, data = self.mailbox.select("INBOX")
+                    total_messages = int(data[0].decode())
                     
-                    mail_ids = data[0].split()
-                    for mail_id in mail_ids:
-                        _, msg_data = service.fetch(mail_id, '(BODY[TEXT])')
-                        msg = msg_data[0][1].decode("utf-8")
+                    if total_messages == 0:
+                        self.logger.debug("No messages in mailbox")
+                        if not wait_for_match:
+                            return None
+                        continue
+                    
+                    # Process emails from newest to oldest, in batches
+                    batch_size = 50
+                    start_msg = max(1, total_messages - batch_size + 1)
+                    
+                    # Fetch batch of recent emails (newest first)
+                    msg_range = f'{start_msg}:{total_messages}'
+                    _, fetch_data = self.mailbox.fetch(msg_range, '(FLAGS RFC822)')
+                    
+                    # Process in reverse order (newest first)
+                    items = []
+                    for i in range(0, len(fetch_data), 2):
+                        if fetch_data[i] is not None:
+                            items.append(fetch_data[i])
+                    items.reverse()
+                    
+                    for item in items:
+                        if not item or len(item) < 2:
+                            continue
+                        
+                        # Check flags for unread filter
+                        flags_str = item[0].decode() if item[0] else ""
+                        is_seen = "\\Seen" in flags_str
+                        
+                        # Extract message number for marking as read
+                        msg_num_match = re.search(r'^(\d+)', flags_str)
+                        msg_num = msg_num_match.group(1) if msg_num_match else None
+                        
+                        # Skip if we only want unread and this is read
+                        if unread and is_seen:
+                            continue
+                        
+                        raw_email = item[1]
+                        
+                        # Parse the email message properly
+                        email_message = email.message_from_bytes(raw_email)
+                        
+                        # Extract body text
+                        msg = self._get_email_body(email_message)
 
                         match = True
                         for key, value in query.items():
                             if key.lower() in ["subject", "from", "to"]:
-                                header = service.fetch(mail_id, f'(BODY.PEEK[HEADER.FIELDS ({key.upper()})])')[1][0][1].decode("utf-8")
-
+                                header = email_message.get(key, "")
+                                
                                 if isinstance(value, str):
                                     if value not in header:
                                         match = False
@@ -384,6 +484,13 @@ class EmailMonitor:
                                         match = False
                                         break
                         if match:
+                            # Mark as read if requested
+                            if mark_as_read and msg_num:
+                                try:
+                                    self.mailbox.store(msg_num, '+FLAGS', '\\Seen')
+                                except:
+                                    pass
+                            
                             if value := query.get('text'):
                                 if isinstance(value, str):
                                     if value in msg:
@@ -397,6 +504,11 @@ class EmailMonitor:
                 self.logger.error(f"Error while searching for emails: {e}")
                 self.logger.info("Trying to reconnect...")
                 self.connect()
-            finally:
-                sleep(delay)
-        return None
+            
+            # If not waiting for match, return None after first search
+            if not wait_for_match:
+                return None
+            
+            # Wait before next search attempt
+            self.logger.info(f"No match found, waiting {delay} seconds before next search...")
+            sleep(delay)
